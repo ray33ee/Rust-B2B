@@ -1,4 +1,3 @@
-
 use serde::{Serialize, Deserialize};
 
 use crate::error::{Result, ErrorKind, Error};
@@ -7,7 +6,7 @@ pub const BYTES_PER_PIXEL: u32 = 4;
 pub const B2B_SIGNATURE: u128 = 0x6FAFEC0D7EF10C4468E85B0B9C0FB9E;
 pub const BITMAP_HEADER_SIZE: u32 = 0x8A;
 pub const BITMAP_ID: u16 = 0x4D42;
-pub const B2B_HEADER_SIZE: u32 = 24;
+pub const B2B_HEADER_SIZE: u32 = 40;
 
 #[derive(Serialize, Deserialize)]
 struct BitmapV5Header {
@@ -46,11 +45,41 @@ struct BitmapV5Header {
     reserved: u32,
 }
 
+///If MSB of the u128 is set, the other bits represent the digest. if MSB is 0, there is no digest
+#[derive(Serialize, Deserialize, Clone)]
+struct CompactOptionalDigest(u128);
+
+impl Copy for CompactOptionalDigest {}
+
+impl CompactOptionalDigest {
+    fn new(optional_digest: Option<u128>) -> Self {
+        let compact = match optional_digest {
+            None => {0}
+            Some(num) => {num | (1 << 127)}
+        };
+        Self(compact)
+    }
+
+    fn get(&self) -> Option<u128> {
+
+        if self.0 & (1 << 127) != 0 {
+            Some(self.0 & !(1u128 << 127))
+        } else {
+            None
+        }
+    }
+
+    fn compare(&self, other: u128) -> bool {
+        self.get().unwrap() == (other & !(1u128 << 127))
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct B2BHeader {
     padding_size: u32,
     original_file_size: u32,
     signature: u128,
+    od: CompactOptionalDigest,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -99,22 +128,23 @@ impl BitmapV5Header {
 }
 
 impl B2BHeader {
-    fn new(padding_size: u32, file_size: u64) -> Self {
+    fn new(padding_size: u32, file_size: u64, optional_digest: Option<u128>) -> Self {
         Self {
             padding_size,
             original_file_size: file_size as u32,
             signature: B2B_SIGNATURE,
+            od: CompactOptionalDigest::new(optional_digest),
         }
     }
 }
 
 impl Header {
-    pub fn new(file_size: u64) -> Self {
+    pub fn new(file_size: u64, optional_digest: Option<u128>) -> Self {
         let (width, height, pixmap_size, padding_size) = Self::get_properties(file_size);
 
         Self {
             bmp: BitmapV5Header::new(width, height, pixmap_size),
-            b2b: B2BHeader::new(padding_size, file_size),
+            b2b: B2BHeader::new(padding_size, file_size, optional_digest),
         }
     }
 
@@ -156,6 +186,18 @@ impl Header {
         }
     }
 
+    ///Returns a (verified, error) pair
+    pub fn verify(&self, other_digest: u128) -> (bool, bool) {
+        match self.b2b.od.get() {
+            None => {
+                //If the bitmap was created without the -v command, no digest was added. So verifying the created bitmap is not possible
+                (false, true)
+            }
+            Some(_) => {
+                (self.b2b.od.compare(other_digest), false)
+            }
+        }
+    }
     /// Given the size of the file, calculate a suitable width and height for a pixmap (large enough to contain the file data but not so large as to
     /// have too much padding). Then calculate the padding required.
     fn get_properties(file_size: u64) -> (u32, u32, u32, u32) {
